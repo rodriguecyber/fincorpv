@@ -56,15 +56,42 @@ jobs:
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
 
+      - name: Trigger ECR image scan (best-effort)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          aws ecr start-image-scan \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-id imageTag="${IMAGE_TAG}" \
+            --region "${AWS_REGION}" >/dev/null 2>&1 || true
+
       - name: Wait for ECR image scan to complete
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
-          aws ecr wait image-scan-complete \
-            --repository-name "${ECR_REPOSITORY}" \
-            --image-id imageTag="${IMAGE_TAG}" \
-            --region "${AWS_REGION}"
+          # ECR can briefly report ScanNotFoundException right after push.
+          for i in $(seq 1 30); do
+            if aws ecr wait image-scan-complete \
+              --repository-name "${ECR_REPOSITORY}" \
+              --image-id imageTag="${IMAGE_TAG}" \
+              --region "${AWS_REGION}" 2>/tmp/ecr-wait.err; then
+              exit 0
+            fi
+
+            if grep -q "ScanNotFoundException" /tmp/ecr-wait.err; then
+              echo "Scan not found yet (attempt ${i}/30); retrying..."
+              sleep 5
+              continue
+            fi
+
+            cat /tmp/ecr-wait.err >&2
+            exit 1
+          done
+
+          echo "Timed out waiting for ECR image scan to exist/complete."
+          exit 1
 
       - name: Fail build on High/Critical vulnerabilities
         env:
