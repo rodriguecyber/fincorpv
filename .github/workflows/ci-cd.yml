@@ -1,0 +1,86 @@
+name: build-and-push-immutable-image
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: fincorp-repository
+  CODEARTIFACT_DOMAIN: fincorp-domain
+  CODEARTIFACT_REPOSITORY: fincorp-repository
+
+jobs:
+  build_push_scan_gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to CodeArtifact (npm)
+        run: |
+          set -euo pipefail
+          aws codeartifact login \
+            --tool npm \
+            --domain "${CODEARTIFACT_DOMAIN}" \
+            --repository "${CODEARTIFACT_REPOSITORY}" \
+            --region "${AWS_REGION}"
+
+      - name: Install npm deps via CodeArtifact proxy
+        run: |
+          set -euo pipefail
+          npm ci --omit=dev
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image (immutable tag = commit SHA)
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
+
+      - name: Wait for ECR image scan to complete
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          aws ecr wait image-scan-complete \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-id imageTag="${IMAGE_TAG}" \
+            --region "${AWS_REGION}"
+
+      - name: Fail build on High/Critical vulnerabilities
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export FINDINGS_JSON="$(aws ecr describe-image-scan-findings \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-id imageTag="${IMAGE_TAG}" \
+            --region "${AWS_REGION}")"
+
+          HIGH="$(node -e 'const doc=JSON.parse(process.env.FINDINGS_JSON||"{}"); const c=(doc.imageScanFindings||{}).findingSeverityCounts||{}; process.stdout.write(String(Number(c.HIGH||0)));')"
+          CRITICAL="$(node -e 'const doc=JSON.parse(process.env.FINDINGS_JSON||"{}"); const c=(doc.imageScanFindings||{}).findingSeverityCounts||{}; process.stdout.write(String(Number(c.CRITICAL||0)));')"
+
+          echo "ECR scan severity counts: CRITICAL=${CRITICAL} HIGH=${HIGH}"
+          if [ "${CRITICAL}" -gt 0 ] || [ "${HIGH}" -gt 0 ]; then
+            echo "Blocking release due to High/Critical vulnerabilities."
+            exit 1
+          fi

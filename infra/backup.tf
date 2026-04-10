@@ -3,7 +3,7 @@ resource "aws_backup_vault" "primary" {
 }
 
 resource "aws_backup_vault" "secondary" {
-  provider = aws.north
+  provider = aws.west
   name     = "fincorp-backup-vault-secondary"
 
 }
@@ -14,8 +14,7 @@ resource "aws_backup_plan" "plan" {
   rule {
     rule_name         = "daily-backup"
     target_vault_name = aws_backup_vault.primary.name
-    schedule          = "cron(0 12 * * ? *)" # Daily at 12:00 PM UTC
-
+    schedule          = "cron(0 2 * * ? *)"
     lifecycle {
       delete_after = 7
     }
